@@ -71,7 +71,10 @@ Once DKV is built, the `<PROJECT_ROOT>/bin` folder should contain the following 
 A single DKV instance can be launched using the following command:
 
 ```bash
-$ ./bin/dkvsrv --config dkvsrv.yaml  --db-folder <folder_name>  --listen-addr <host:port>
+$ ./bin/dkvsrv \
+    -db-folder <folder_name> \
+    -listen-addr <host:port> \
+    -db-engine <rocksdb|badger>
 ```
 
 ```bash
@@ -81,7 +84,7 @@ $ ./bin/dkvctl -dkvAddr <host:port> -get <key>
 
 Example session:
 ```bash
-$ ./bin/dkvsrv --config dkvsrv.yaml --db-folder /tmp/db --listen-addr 127.0.0.1:8080
+$ ./bin/dkvsrv -db-folder /tmp/db -listen-addr 127.0.0.1:8080 -db-engine rocksdb
 $ ./bin/dkvctl -dkvAddr 127.0.0.1:8080 -set foo bar
 $ ./bin/dkvctl -dkvAddr 127.0.0.1:8080 -get foo
 bar
