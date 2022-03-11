@@ -1,10 +1,7 @@
 package main
 
 import (
-	"encoding/json"
-	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"net"
 	"net/http"
@@ -14,109 +11,31 @@ import (
 	"path"
 	"strings"
 	"syscall"
-	"time"
 
 	"github.com/flipkart-incubator/dkv/internal/discovery"
-	"github.com/gorilla/mux"
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
-	"gopkg.in/ini.v1"
-
-	"github.com/flipkart-incubator/dkv/pkg/health"
-
 	"github.com/flipkart-incubator/dkv/internal/master"
 	"github.com/flipkart-incubator/dkv/internal/opts"
 	"github.com/flipkart-incubator/dkv/internal/slave"
 	"github.com/flipkart-incubator/dkv/internal/stats"
-	"github.com/flipkart-incubator/dkv/internal/stats/aggregate"
 	"github.com/flipkart-incubator/dkv/internal/storage"
 	"github.com/flipkart-incubator/dkv/internal/storage/badger"
 	"github.com/flipkart-incubator/dkv/internal/storage/rocksdb"
 	"github.com/flipkart-incubator/dkv/internal/sync"
+	"github.com/flipkart-incubator/dkv/pkg/health"
 	"github.com/flipkart-incubator/dkv/pkg/serverpb"
 	nexus_api "github.com/flipkart-incubator/nexus/pkg/api"
 	nexus "github.com/flipkart-incubator/nexus/pkg/raft"
+
 	grpc_zap "github.com/grpc-ecosystem/go-grpc-middleware/logging/zap"
+	flag "github.com/spf13/pflag"
 	"go.uber.org/zap"
 	"go.uber.org/zap/zapcore"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/reflection"
+	"gopkg.in/ini.v1"
 
-	"net/http/pprof"
+	_ "net/http/pprof"
 )
-
-//Config Variables
-var (
-	// region level configuration.
-	// TODO - move them to config file to setup multiple regions in a node
-	disklessMode     bool
-	dbEngine         string
-	dbEngineIni      string
-	dbRole           string
-	replPollInterval time.Duration
-	blockCacheSize   uint64
-	dcID             string
-	database         string
-	vBucket          string
-
-	// Node level configuration common for all regions in the node
-	dbFolder       string
-	dbListenAddr   string
-	statsdAddr     string
-	httpListenAddr string
-
-	// Service discovery related params
-	discoveryConf string
-
-	// Temporary variables to be removed once https://github.com/flipkart-incubator/dkv/issues/82 is fixed
-	// The above issue causes replication issues during master switch due to inconsistent change numbers
-	// Thus enabling hardcoded masters to not degrade current behaviour
-	replMasterAddr        string
-	disableAutoMasterDisc bool
-
-	// Logging vars
-	dbAccessLog    string
-	verboseLogging bool
-
-	pprofEnable bool
-
-	nexusLogDirFlag, nexusSnapDirFlag *flag.Flag
-)
-
-var (
-	accessLogger *zap.Logger
-	dkvLogger    *zap.Logger
-
-	statsCli      stats.Client
-	promRegistry  prometheus.Registerer
-	statsStreamer *stats.StatStreamer
-
-	discoveryClient        discovery.Client
-	statAggregatorRegistry *aggregate.StatAggregatorRegistry
-)
-
-func init() {
-	flag.BoolVar(&disklessMode, "diskless", false, fmt.Sprintf("Enables diskless mode where data is stored entirely in memory.\nAvailable on Badger for standalone and slave roles. (default %v)", disklessMode))
-	flag.StringVar(&dbFolder, "db-folder", "/tmp/dkvsrv", "DB folder path for storing data files")
-	flag.StringVar(&dbListenAddr, "listen-addr", "0.0.0.0:8080", "Address on which the DKV service binds")
-	flag.StringVar(&httpListenAddr, "http-listen-addr", "0.0.0.0:8081", "Address on which the http service binds")
-	flag.StringVar(&dbEngine, "db-engine", "rocksdb", "Underlying DB engine for storing data - badger|rocksdb")
-	flag.StringVar(&dbEngineIni, "db-engine-ini", "", "An .ini file for configuring the underlying storage engine. Refer badger.ini or rocks.ini for more details.")
-	flag.StringVar(&dbRole, "role", "none", "DB role of this node - none|master|slave|discovery")
-	flag.StringVar(&discoveryConf, "discovery-service-config", "", "A .ini file for configuring discovery service parameters")
-	flag.StringVar(&statsdAddr, "statsd-addr", "", "StatsD service address in host:port format")
-	flag.DurationVar(&replPollInterval, "repl-poll-interval", 5*time.Second, "Interval used for polling changes from master. Eg., 10s, 5ms, 2h, etc.")
-	flag.StringVar(&dbAccessLog, "access-log", "", "File for logging DKV accesses eg., stdout, stderr, /tmp/access.log")
-	flag.BoolVar(&verboseLogging, "verbose", false, fmt.Sprintf("Enable verbose logging.\nBy default, only warnings and errors are logged. (default %v)", verboseLogging))
-	flag.Uint64Var(&blockCacheSize, "block-cache-size", defBlockCacheSize, "Amount of cache (in bytes) to set aside for data blocks. A value of 0 disables block caching altogether.")
-	flag.StringVar(&dcID, "dc-id", "default", "DC / Availability zone identifier")
-	flag.StringVar(&database, "database", "default", "Database identifier")
-	flag.StringVar(&vBucket, "vBucket", "default", "vBucket identifier")
-	flag.StringVar(&replMasterAddr, "repl-master-addr", "", "Service address of DKV master node for replication")
-	flag.BoolVar(&disableAutoMasterDisc, "disable-auto-master-disc", true, "Disable automated master discovery. Suggested to set to true until https://github.com/flipkart-incubator/dkv/issues/82 is fixed")
-	flag.BoolVar(&pprofEnable, "pprof", false, "Enable pprof profiling")
-	setDKVDefaultsForNexusDirs()
-}
 
 type dkvSrvrRole string
 
@@ -125,28 +44,66 @@ const (
 	masterRole    dkvSrvrRole = "master"
 	slaveRole     dkvSrvrRole = "slave"
 	discoveryRole dkvSrvrRole = "discovery"
-)
 
-const defBlockCacheSize = 3 << 30
-
-const (
+	defBlockCacheSize     = 3 << 30
 	discoveryServerConfig = "serverConfig"
 	discoveryClientConfig = "clientConfig"
 )
 
+var (
+	//Config file used for reading and using configs
+	cfgFile string
+
+	//appConfig
+	config opts.Config
+
+	//nexus flags
+	nexusLogDirFlag, nexusSnapDirFlag *flag.Flag
+
+	// Logging vars
+	verboseLogging bool
+	accessLogger   *zap.Logger
+	dkvLogger      *zap.Logger
+	pprofEnable    bool
+
+	// Other vars
+	statsCli stats.Client
+)
+
+func init() {
+	initializeFlags()
+}
+
+func initializeFlags() {
+	flag.CommandLine.ParseErrorsWhitelist = flag.ParseErrorsWhitelist{UnknownFlags: true}
+	flag.StringVarP(&cfgFile, "config", "c", "", "config file (default is /etc/default/dkvsrv.yaml)")
+	flag.BoolVarP(&verboseLogging, "verbose", "v", false, fmt.Sprintf("Enable verbose logging.\nBy default, only warnings and errors are logged. (default %v)", verboseLogging))
+	flag.BoolVarP(&pprofEnable, "pprof", "p", false, "Enable pprof profiling")
+}
+
 func main() {
+
+	//load config
 	flag.Parse()
-	validateFlags()
+	config.Init(cfgFile)
+	config.Print()
+
 	setupDKVLogger()
 	setupAccessLogger()
 	setFlagsForNexusDirs()
 	setupStats()
-	go setupHttpServer()
+
+	if pprofEnable {
+		go func() {
+			log.Printf("[INFO] Starting pprof on port 6060\n")
+			log.Println(http.ListenAndServe("0.0.0.0:6060", nil))
+		}()
+	}
 
 	kvs, cp, ca, br := newKVStore()
 	grpcSrvr, lstnr := newGrpcServerListener()
 	defer grpcSrvr.GracefulStop()
-	srvrRole := toDKVSrvrRole(dbRole)
+	srvrRole := toDKVSrvrRole(config.DbRole)
 	//srvrRole.printFlags()
 
 	// Create the region info which is passed to DKVServer
@@ -155,11 +112,10 @@ func main() {
 		log.Panicf("Failed to detect IP Address %v.", err)
 	}
 	regionInfo := &serverpb.RegionInfo{
-		DcID:            dcID,
+		DcID:            config.DcID,
 		NodeAddress:     nodeAddr.Host,
-		HttpAddress:     httpListenAddr,
-		Database:        database,
-		VBucket:         vBucket,
+		Database:        config.Database,
+		VBucket:         config.VBucket,
 		Status:          serverpb.RegionStatus_INACTIVE,
 		MasterHost:      nil,
 		NexusClusterUrl: nil,
@@ -169,9 +125,9 @@ func main() {
 		Logger:                    dkvLogger,
 		HealthCheckTickerInterval: opts.DefaultHealthCheckTickterInterval, //to be exposed later via app.conf
 		StatsCli:                  statsCli,
-		PrometheusRegistry:        promRegistry,
 	}
 
+	var discoveryClient discovery.Client
 	if srvrRole != noRole && srvrRole != discoveryRole {
 		var err error
 		discoveryClient, err = newDiscoveryClient()
@@ -192,7 +148,7 @@ func main() {
 		health.RegisterHealthServer(grpcSrvr, dkvSvc)
 	case masterRole, discoveryRole:
 		if cp == nil {
-			log.Panicf("Storage engine %s is not supported for DKV master role.", dbEngine)
+			log.Panicf("Storage engine %s is not supported for DKV master role.", config.DbEngine)
 		}
 		var dkvSvc master.DKVService
 		if haveFlagsWithPrefix("nexus") {
@@ -222,11 +178,11 @@ func main() {
 		maxNumChanges := uint32(10000)
 		replConfig := &slave.ReplicationConfig{
 			MaxNumChngs:           maxNumChanges,
-			ReplPollInterval:      replPollInterval,
+			ReplPollInterval:      config.ReplPollInterval,
 			MaxActiveReplLag:      uint64(maxNumChanges * 10),
-			MaxActiveReplElapsed:  uint64(replPollInterval.Seconds()) * 10,
-			DisableAutoMasterDisc: disableAutoMasterDisc,
-			ReplMasterAddr:        replMasterAddr,
+			MaxActiveReplElapsed:  uint64(config.ReplPollInterval.Seconds()) * 10,
+			DisableAutoMasterDisc: config.DisableAutoMasterDisc,
+			ReplMasterAddr:        config.ReplicationMasterAddr,
 		}
 		dkvSvc, _ := slave.NewService(kvs, ca, regionInfo, replConfig, discoveryClient, serveropts)
 		defer dkvSvc.Close()
@@ -241,34 +197,9 @@ func main() {
 	log.Printf("[WARN] Caught signal: %v. Shutting down...\n", sig)
 }
 
-func validateFlags() {
-	if dbListenAddr != "" && strings.IndexRune(dbListenAddr, ':') < 0 {
-		log.Panicf("given listen address: %s is invalid, must be in host:port format", dbListenAddr)
-	}
-	if statsdAddr != "" && strings.IndexRune(statsdAddr, ':') < 0 {
-		log.Panicf("given StatsD address: %s is invalid, must be in host:port format", statsdAddr)
-	}
-
-	if disklessMode && strings.ToLower(dbEngine) == "rocksdb" {
-		log.Panicf("diskless is available only on Badger storage")
-	}
-
-	if dbEngineIni != "" {
-		if _, err := os.Stat(dbEngineIni); err != nil && os.IsNotExist(err) {
-			log.Panicf("given storage configuration file: %s does not exist", dbEngineIni)
-		}
-	}
-
-	if dbRole == "slave" && disableAutoMasterDisc {
-		if replMasterAddr == "" || strings.IndexRune(replMasterAddr, ':') < 0 {
-			log.Panicf("given master address: %s for replication is invalid, must be in host:port format", replMasterAddr)
-		}
-	}
-}
-
 func setupAccessLogger() {
 	accessLogger = zap.NewNop()
-	if dbAccessLog != "" {
+	if config.AccessLog != "" {
 		accessLoggerConfig := zap.Config{
 			Level:         zap.NewAtomicLevelAt(zap.InfoLevel),
 			Development:   false,
@@ -289,8 +220,8 @@ func setupAccessLogger() {
 				EncodeCaller:   zapcore.ShortCallerEncoder,
 			},
 
-			OutputPaths:      []string{dbAccessLog},
-			ErrorOutputPaths: []string{dbAccessLog},
+			OutputPaths:      []string{config.AccessLog},
+			ErrorOutputPaths: []string{config.AccessLog},
 		}
 		if lg, err := accessLoggerConfig.Build(); err != nil {
 			log.Printf("[WARN] Unable to configure access logger. Error: %v\n", err)
@@ -348,7 +279,7 @@ func newGrpcServerListener() (*grpc.Server, net.Listener) {
 
 func newListener() (lis net.Listener) {
 	var err error
-	if lis, err = net.Listen("tcp", dbListenAddr); err != nil {
+	if lis, err = net.Listen("tcp", config.ListenAddr); err != nil {
 		log.Panicf("failed to listen: %v", err)
 		return
 	}
@@ -372,107 +303,54 @@ func haveFlagsWithPrefix(prefix string) bool {
 	return res
 }
 
-func printFlagsWithoutPrefix(prefixes ...string) {
-	flag.VisitAll(func(f *flag.Flag) {
-		shouldPrint := true
-		for _, pf := range prefixes {
-			if strings.HasPrefix(f.Name, pf) {
-				shouldPrint = false
-				break
-			}
-		}
-		if shouldPrint {
-			log.Printf("%s (%s): %v\n", f.Name, f.Usage, f.Value)
-		}
-	})
-}
-
-func printFlagsWithPrefix(prefixes ...string) {
-	flag.VisitAll(func(f *flag.Flag) {
-		for _, pf := range prefixes {
-			if strings.HasPrefix(f.Name, pf) {
-				log.Printf("%s (%s): %v\n", f.Name, f.Usage, f.Value)
-			}
-		}
-	})
-}
-
 func toDKVSrvrRole(role string) dkvSrvrRole {
 	return dkvSrvrRole(strings.TrimSpace(strings.ToLower(role)))
 }
 
-func (role dkvSrvrRole) printFlags() {
-	log.Println("Launching DKV server with following flags:")
-	switch role {
-	case noRole:
-		printFlagsWithPrefix("db")
-	case masterRole, discoveryRole:
-		if haveFlagsWithPrefix("nexus") {
-			printFlagsWithPrefix("db", "nexus")
-		} else {
-			printFlagsWithPrefix("db")
-		}
-	case slaveRole:
-		printFlagsWithPrefix("db", "repl")
-	}
-	printFlagsWithoutPrefix("db", "repl", "nexus")
-}
-
-func setDKVDefaultsForNexusDirs() {
-	nexusLogDirFlag, nexusSnapDirFlag = flag.Lookup("nexus-log-dir"), flag.Lookup("nexus-snap-dir")
-	dbPath := flag.Lookup("db-folder").DefValue
-	nexusLogDirFlag.DefValue, nexusSnapDirFlag.DefValue = path.Join(dbPath, "logs"), path.Join(dbPath, "snap")
-	nexusLogDirFlag.Value.Set("")
-	nexusSnapDirFlag.Value.Set("")
-}
-
 func setFlagsForNexusDirs() {
+
+	nexusLogDirFlag, nexusSnapDirFlag = flag.Lookup("nexus-log-dir"), flag.Lookup("nexus-snap-dir")
 	if nexusLogDirFlag.Value.String() == "" {
-		nexusLogDirFlag.Value.Set(path.Join(dbFolder, "logs"))
+		nexusLogDirFlag.Value.Set(path.Join(config.DbFolder, "logs"))
 	}
 	if nexusSnapDirFlag.Value.String() == "" {
-		nexusSnapDirFlag.Value.Set(path.Join(dbFolder, "snap"))
+		nexusSnapDirFlag.Value.Set(path.Join(config.DbFolder, "snap"))
 	}
 }
 
 func setupStats() {
-	if statsdAddr != "" {
-		statsCli = stats.NewStatsDClient(statsdAddr, "dkv.")
+	if config.StatsdAddr != "" {
+		statsCli = stats.NewStatsDClient(config.StatsdAddr, "dkv.")
 	} else {
 		statsCli = stats.NewNoOpClient()
 	}
-	promRegistry = stats.NewPromethousRegistry()
-	statsStreamer = stats.NewStatStreamer()
-	statAggregatorRegistry = aggregate.NewStatAggregatorRegistry()
-	go statsStreamer.Run()
 }
 
 func newKVStore() (storage.KVStore, storage.ChangePropagator, storage.ChangeApplier, storage.Backupable) {
 	slg := dkvLogger.Sugar()
 	defer slg.Sync()
 
-	if err := os.MkdirAll(dbFolder, 0777); err != nil {
-		slg.Fatalf("Unable to create DB folder at %s. Error: %v.", dbFolder, err)
+	if err := os.MkdirAll(config.DbFolder, 0777); err != nil {
+		slg.Fatalf("Unable to create DB folder at %s. Error: %v.", config.DbFolder, err)
 	}
 
-	dataDir := path.Join(dbFolder, "data")
+	dataDir := path.Join(config.DbFolder, "data")
 	slg.Infof("Using %s as data directory", dataDir)
 
-	sstDir := path.Join(dbFolder, "sst")
+	sstDir := path.Join(config.DbFolder, "sst")
 	if err := os.MkdirAll(sstDir, 0777); err != nil {
-		slg.Fatalf("Unable to create sst folder at %s. Error: %v.", dbFolder, err)
+		slg.Fatalf("Unable to create sst folder at %s. Error: %v.", config.DbFolder, err)
 	}
 
-	switch dbEngine {
+	switch config.DbEngine {
 	case "rocksdb":
 		rocksDb, err := rocksdb.OpenDB(dataDir,
 			rocksdb.WithSSTDir(sstDir),
 			rocksdb.WithSyncWrites(),
-			rocksdb.WithCacheSize(blockCacheSize),
-			rocksdb.WithRocksDBConfig(dbEngineIni),
+			rocksdb.WithCacheSize(config.BlockCacheSize),
+			rocksdb.WithRocksDBConfig(config.DbEngineIni),
 			rocksdb.WithLogger(dkvLogger),
-			rocksdb.WithStats(statsCli),
-			rocksdb.WithPromStats(promRegistry))
+			rocksdb.WithStats(statsCli))
 		if err != nil {
 			dkvLogger.Panic("RocksDB engine init failed", zap.Error(err))
 		}
@@ -483,13 +361,12 @@ func newKVStore() (storage.KVStore, storage.ChangePropagator, storage.ChangeAppl
 		bdbOpts := []badger.DBOption{
 			badger.WithSSTDir(sstDir),
 			badger.WithSyncWrites(),
-			badger.WithCacheSize(blockCacheSize),
-			badger.WithBadgerConfig(dbEngineIni),
+			badger.WithCacheSize(config.BlockCacheSize),
+			badger.WithBadgerConfig(config.DbEngineIni),
 			badger.WithLogger(dkvLogger),
 			badger.WithStats(statsCli),
-			badger.WithPromStats(promRegistry),
 		}
-		if disklessMode {
+		if config.DisklessMode {
 			bdbOpts = append(bdbOpts, badger.WithInMemory())
 		} else {
 			bdbOpts = append(bdbOpts, badger.WithDBDir(dataDir))
@@ -500,7 +377,7 @@ func newKVStore() (storage.KVStore, storage.ChangePropagator, storage.ChangeAppl
 		}
 		return badgerDb, badgerDb, badgerDb, badgerDb
 	default:
-		slg.Panicf("Unknown storage engine: %s", dbEngine)
+		slg.Panicf("Unknown storage engine: %s", config.DbEngine)
 		return nil, nil, nil, nil
 	}
 }
@@ -518,7 +395,7 @@ func newDKVReplicator(kvs storage.KVStore) nexus_api.RaftReplicator {
 	mkdirNexusDirs()
 	replStore := sync.NewDKVReplStore(kvs)
 	nexusOpts := nexus.OptionsFromFlags()
-	nexusOpts = append(nexusOpts, nexus.StatsDAddr(statsdAddr))
+	nexusOpts = append(nexusOpts, nexus.StatsDAddr(config.StatsdAddr))
 	if nexusRepl, err := nexus_api.NewRaftReplicator(replStore, nexusOpts...); err != nil {
 		panic(err)
 	} else {
@@ -528,9 +405,9 @@ func newDKVReplicator(kvs storage.KVStore) nexus_api.RaftReplicator {
 }
 
 func registerDiscoveryServer(grpcSrvr *grpc.Server, dkvService master.DKVService) error {
-	iniConfig, err := ini.Load(discoveryConf)
+	iniConfig, err := ini.Load(config.DiscoveryServiceConfig)
 	if err != nil {
-		return fmt.Errorf("unable to load discovery service configuration from given file: %s, error: %v", discoveryConf, err)
+		return fmt.Errorf("unable to load discovery service configuration from given file: %s, error: %v", config.DiscoveryServiceConfig, err)
 	}
 	if discoveryServerSection, err := iniConfig.GetSection(discoveryServerConfig); err == nil {
 		discoverySrvConfig, err := discovery.NewDiscoverConfigFromIni(discoveryServerSection)
@@ -545,14 +422,14 @@ func registerDiscoveryServer(grpcSrvr *grpc.Server, dkvService master.DKVService
 		return nil
 	} else {
 		return fmt.Errorf("started as discovery server but can't load the section %s in file %s, error: %v",
-			discoveryServerConfig, discoveryConf, err)
+			discoveryServerConfig, config.DiscoveryServiceConfig, err)
 	}
 }
 
 func newDiscoveryClient() (discovery.Client, error) {
-	iniConfig, err := ini.Load(discoveryConf)
+	iniConfig, err := ini.Load(config.DiscoveryServiceConfig)
 	if err != nil {
-		return nil, fmt.Errorf("unable to load discovery service configuration from given file: %s, error: %v", discoveryConf, err)
+		return nil, fmt.Errorf("unable to load discovery service configuration from given file: %s, error: %v", config.DiscoveryServiceConfig, err)
 	}
 
 	if discoveryClientSection, err := iniConfig.GetSection(discoveryClientConfig); err == nil {
@@ -567,13 +444,13 @@ func newDiscoveryClient() (discovery.Client, error) {
 		return client, nil
 	} else {
 		return nil, fmt.Errorf("can't load discovery client configuration from section %s in file %s, error: %v",
-			discoveryClientConfig, discoveryConf, err)
+			discoveryClientConfig, config.DiscoveryServiceConfig, err)
 	}
 
 }
 
 func nodeAddress() (*url.URL, error) {
-	ip, port, err := net.SplitHostPort(dbListenAddr)
+	ip, port, err := net.SplitHostPort(config.ListenAddr)
 	if err != nil {
 		return nil, err
 	}
@@ -596,109 +473,4 @@ func nodeAddress() (*url.URL, error) {
 
 	ep := url.URL{Host: fmt.Sprintf("%s:%s", ip, port)}
 	return &ep, nil
-}
-
-func setupHttpServer() {
-	router := mux.NewRouter()
-	router.Handle("/metrics", promhttp.Handler())
-	router.HandleFunc("/metrics/json", jsonMetricHandler)
-
-	router.HandleFunc("/metrics/stream", statsStreamHandler)
-	if dbRole == "discovery" {
-		// Should be enabled only for discovery server ?
-		router.HandleFunc("/metrics/cluster", clusterMetricsHandler)
-	}
-
-	//Pprof
-	if pprofEnable {
-		log.Printf("[INFO] Enabling pprof...\n")
-		router.HandleFunc("/debug/pprof/", pprof.Index)
-		router.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-		router.HandleFunc("/debug/pprof/profile", pprof.Profile)
-		router.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-		router.HandleFunc("/debug/pprof/trace", pprof.Trace)
-	}
-
-	http.Handle("/", router)
-	http.ListenAndServe(httpListenAddr, nil)
-}
-
-func jsonMetricHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	metrics, _ := stats.GetMetrics()
-	json.NewEncoder(w).Encode(metrics)
-}
-
-func statsStreamHandler(w http.ResponseWriter, r *http.Request) {
-	if f, ok := w.(http.Flusher); !ok {
-		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
-		return
-	} else {
-		// Set the headers related to event streaming.
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
-		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-
-		statChannel := make(chan stats.DKVMetrics, 5)
-		channelId := statsStreamer.Register(statChannel)
-		defer func() {
-			ioutil.ReadAll(r.Body)
-			r.Body.Close()
-		}()
-		// Listen to the closing of the http connection via the CloseNotifier
-		notify := w.(http.CloseNotifier).CloseNotify()
-		for {
-			select {
-			case stat := <-statChannel:
-				statJson, _ := json.Marshal(stat)
-				fmt.Fprintf(w, "data: %s\n\n", statJson)
-				f.Flush()
-			case <-notify:
-				statsStreamer.DeRegister(channelId)
-				return
-			}
-		}
-	}
-}
-
-func clusterMetricsHandler(w http.ResponseWriter, r *http.Request) {
-	regions, err := discoveryClient.GetClusterStatus("", "")
-	if err != nil {
-		http.Error(w, "Unable to discover peers!", http.StatusInternalServerError)
-		return
-	}
-	if f, ok := w.(http.Flusher); !ok {
-		http.Error(w, "Streaming unsupported!", http.StatusInternalServerError)
-		return
-	} else {
-		// Set the headers related to event streaming.
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set("Cache-Control", "no-cache")
-		w.Header().Set("Connection", "keep-alive")
-		w.Header().Set("Access-Control-Allow-Origin", r.Header.Get("Origin"))
-		w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
-
-		statChannel := make(chan map[string]*stats.DKVMetrics, 5)
-		channelId := statAggregatorRegistry.Register(regions, func(region *serverpb.RegionInfo) string { return region.Database }, statChannel)
-		defer func() {
-			ioutil.ReadAll(r.Body)
-			r.Body.Close()
-		}()
-		// Listen to the closing of the http connection via the CloseNotifier
-		notify := w.(http.CloseNotifier).CloseNotify()
-		for {
-			select {
-			case stat := <-statChannel:
-				statJson, _ := json.Marshal(stat)
-				fmt.Fprintf(w, "data: %s\n\n", statJson)
-				f.Flush()
-			case <-notify:
-				fmt.Println("http request closed")
-				statAggregatorRegistry.DeRegister(channelId)
-				return
-			}
-		}
-	}
 }
